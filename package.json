@@ -1,0 +1,70 @@
+{
+  "name": "ai-auth-login",
+  "version": "1.1.0",
+  "description": "Use AI Subscription as OpenAI SDK adapter (Codex/Kimi/...)",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "url": "https://github.com/idodonet/ai-auth-login.git"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./aistudio-browser": {
+      "types": "./dist/providers/aistudio/browser-client.d.ts",
+      "import": "./dist/providers/aistudio/browser-client.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "NOTICE",
+    "docs"
+  ],
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "node -e \"require('node:fs').rmSync('dist-test', { recursive: true, force: true })\" && tsc -p tsconfig.test.json && node --test \"dist-test/test/**/*.test.js\"",
+    "prepack": "npm run build:demo",
+    "build:demo": "node scripts/build-demo.mjs",
+    "release": "semantic-release",
+    "test:package": "node scripts/package-smoke.mjs",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "license": "MIT",
+  "dependencies": {
+    "openai": "^6.0.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
+    "prettier": "3.9.9",
+    "semantic-release": "^25.0.9",
+    "typescript": "^5.9.0"
+  },
+  "bin": {
+    "ai-auth-login": "./dist/cli.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "openai",
+    "oauth",
+    "codex",
+    "kimi",
+    "authentication",
+    "ai",
+    "sdk",
+    "cli",
+    "typescript"
+  ]
+}

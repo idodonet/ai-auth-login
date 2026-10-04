@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tgz
+.env
+dist-test/
+.DS_Store
+
+.provider-state.json
+.provider-state.json.tmp
+.npmrc
