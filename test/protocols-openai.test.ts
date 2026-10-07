@@ -5,11 +5,28 @@ import {
   responsesToChat,
   executeChat,
   executeResponses,
+  normalizeResponsesResponse,
 } from "../src/protocols/responses.js";
 import { parseSSE, encodeSSE } from "../src/protocols/sse.js";
+import { xai } from "../src/providers/xai/index.js";
+import { meta } from "../src/providers/meta/index.js";
 
 const request = (body: unknown) =>
   new Request("https://internal/v1", { method: "POST", body: JSON.stringify(body) });
+test("Responses prefix detection aborts a pending read and releases its reader", async () => {
+  const controller = new AbortController();
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const result = normalizeResponsesResponse(new Response(body), controller.signal);
+  controller.abort();
+  await assert.rejects(result, { name: "AbortError" });
+  assert.equal(cancelled, true);
+  assert.equal(body.locked, false);
+});
 function sse(values: unknown[]): Response {
   return new Response(
     new ReadableStream({
@@ -23,6 +40,83 @@ function sse(values: unknown[]): Response {
     { headers: { "content-type": "text/event-stream" } },
   );
 }
+test("xAI and Meta collect mislabeled Responses SSE in both nonstream endpoints", async () => {
+  const value = {
+    id: "r",
+    object: "response",
+    model: "m",
+    created_at: 0,
+    status: "completed",
+    output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "1" }] }],
+  };
+  for (const adapter of [xai, meta]) {
+    for (const path of ["/responses", "/chat/completions"]) {
+      for (const contentType of [
+        undefined,
+        "application/json",
+        "text/plain",
+        "text/event-stream",
+      ]) {
+        for (const wire of ["json", "sse"]) {
+          if (wire === "json" && contentType === "text/event-stream") continue;
+          let cancelled = false;
+          const raw = new TextEncoder().encode(
+            wire === "json"
+              ? JSON.stringify(value)
+              : `: heartbeat\n\nevent: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: value })}\n\n`,
+          );
+          const response = await adapter.execute(
+            new Request(`https://internal/v1${path}`, {
+              method: "POST",
+              body: JSON.stringify(
+                path === "/responses"
+                  ? { model: "m", input: "Say 1" }
+                  : { model: "m", messages: [{ role: "user", content: "Say 1" }] },
+              ),
+            }),
+            {
+              provider: adapter.descriptor.id,
+              authenticatedAt: null,
+              credentials: { apiKey: "fixture" },
+            },
+            {
+              signal: new AbortController().signal,
+              fetch: async () =>
+                new Response(
+                  new ReadableStream<Uint8Array>({
+                    start(controller) {
+                      // A fragmented prefix must not cause JSON parsing or wait for SSE EOF.
+                      for (const byte of raw) controller.enqueue(Uint8Array.of(byte));
+                      if (wire === "json") controller.close();
+                    },
+                    cancel() {
+                      cancelled = true;
+                    },
+                  }),
+                  {
+                    headers: {
+                      ...(contentType ? { "content-type": contentType } : {}),
+                      "x-request-id": "r",
+                    },
+                  },
+                ),
+            },
+          );
+          assert.equal(response.status, 200);
+          assert.equal(response.headers.get("x-request-id"), "r");
+          const result = await response.json();
+          assert.equal(
+            path === "/responses"
+              ? result.output[0].content[0].text
+              : result.choices[0].message.content,
+            "1",
+          );
+          if (wire === "sse") assert.equal(cancelled, true);
+        }
+      }
+    }
+  }
+});
 test("SSE decodes fragmented UTF8, CRLF, multiline data and cancels", async () => {
   const bytes = new TextEncoder().encode("event: hello\r\ndata: hé\r\ndata: there\r\n\r\n");
   let cancelled = false;

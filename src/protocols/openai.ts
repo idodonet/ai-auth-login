@@ -1,3 +1,5 @@
+import { normalizeResponsesResponse } from "./responses.js";
+
 export type JSONBody = Record<string, any>;
 export type NativeFetch = (body: JSONBody, signal: AbortSignal) => Promise<Response>;
 
@@ -9,7 +11,9 @@ export function protocolError(message: string, status = 400): Response {
 }
 
 export async function executeOpenAI(request: Request, fetchNative: NativeFetch): Promise<Response> {
-  return fetchNative((await request.json()) as JSONBody, request.signal);
+  const body = (await request.json()) as JSONBody;
+  const response = await fetchNative(body, request.signal);
+  return body.stream ? response : normalizeResponsesResponse(response, request.signal);
 }
 
 export function rejectFields(body: JSONBody, allowed: readonly string[]): void {

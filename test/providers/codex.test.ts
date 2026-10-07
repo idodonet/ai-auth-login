@@ -133,6 +133,51 @@ test("Codex responses enforce native restrictions and recover nonstream SSE", as
   );
   assert.equal((await response.json()).id, "resp_1");
 });
+test("Codex collects required SSE without relying on content-type for either SDK endpoint", async () => {
+  for (const contentType of [undefined, "text/plain", "application/json", "text/event-stream"]) {
+    for (const path of ["/responses", "/chat/completions"]) {
+      const response = await codex.execute(
+        new Request(`https://internal/v1${path}`, {
+          method: "POST",
+          body: JSON.stringify({
+            model: "gpt-6.1-sol",
+            ...(path === "/responses"
+              ? { input: 'Say "1"' }
+              : {
+                  messages: [{ role: "user", content: 'Say "1"' }],
+                  max_completion_tokens: 1,
+                  reasoning_effort: "low",
+                }),
+          }),
+        }),
+        state,
+        context((_url, init) => {
+          const body = JSON.parse(String(init?.body));
+          assert.equal(body.stream, true);
+          assert.equal(body.max_output_tokens, undefined);
+          return new Response(
+            new TextEncoder().encode(
+              'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-6.1-sol","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"1"}]}]}}\n\n',
+            ),
+            {
+              headers: {
+                ...(contentType ? { "content-type": contentType } : {}),
+                "x-request-id": "request-1",
+              },
+            },
+          );
+        }),
+      );
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("x-request-id"), "request-1");
+      const body = await response.json();
+      assert.equal(
+        path === "/responses" ? body.output[0].content[0].text : body.choices[0].message.content,
+        "1",
+      );
+    }
+  }
+});
 test("Codex fresh token force refresh rotates once; explicit validation detects revocation", async () => {
   const fresh = {
     ...state,

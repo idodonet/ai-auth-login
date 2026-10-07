@@ -108,14 +108,27 @@ test("AI Studio browser companion sends only fixed Google routes with browser cr
     }
   }
   let calls = 0;
+  let streamController: ReadableStreamDefaultController<Uint8Array>;
+  let streamed: (() => void) | undefined;
   const stop = connectAIStudioBrowser(
     { url: "ws://127.0.0.1:1234/v1/ws", token: "secret" },
     {
       WebSocket: FakeSocket as unknown as typeof globalThis.WebSocket,
-      fetch: async (_input, init) => {
+      fetch: async (input, init) => {
         calls++;
         assert.equal(init?.credentials, "include");
         assert.equal(init?.redirect, "error");
+        if (String(input).includes(":streamGenerateContent")) {
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                streamController = controller;
+                controller.enqueue(new TextEncoder().encode('data: {"candidates":[]}\n\n'));
+              },
+            }),
+            { headers: { "content-type": "application/json" } },
+          );
+        }
         return Response.json({ models: [] });
       },
     },
@@ -140,6 +153,31 @@ test("AI Studio browser companion sends only fixed Google routes with browser cr
   });
   assert.equal(calls, 1);
   assert.equal(socket!.sent[2].type, "error");
+  const firstChunk = new Promise<void>((resolve) => {
+    streamed = resolve;
+  });
+  const originalSend = socket!.send.bind(socket!);
+  socket!.send = (value: string) => {
+    originalSend(value);
+    if (JSON.parse(value).type === "stream_chunk") streamed!();
+  };
+  const streaming = socket!.onmessage!({
+    data: JSON.stringify({
+      id: "stream",
+      type: "http_request",
+      payload: {
+        method: "POST",
+        url: "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:streamGenerateContent?alt=sse",
+        body: "{}",
+      },
+    }),
+  });
+  await firstChunk;
+  assert.equal(socket!.sent.at(-2).type, "stream_start");
+  assert.equal(socket!.sent.at(-1).type, "stream_chunk");
+  streamController!.close();
+  await streaming;
+  assert.equal(socket!.sent.at(-1).type, "stream_end");
   stop();
 });
 

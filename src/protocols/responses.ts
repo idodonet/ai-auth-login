@@ -824,18 +824,74 @@ async function* responsesStreamToChat(
   }
 }
 
-/** Codex always streams upstream, even for a non-streaming SDK request. */
+/** Collect Responses SSE; providers that require streaming can specify it explicitly. */
 export async function normalizeResponsesResponse(
   response: Response,
   signal?: AbortSignal,
+  stream = response.headers.get("content-type")?.includes("text/event-stream") === true,
 ): Promise<Response> {
-  if (!response.ok || !response.headers.get("content-type")?.includes("text/event-stream")) {
+  if (!response.ok) {
     return response;
   }
-  if (!response.body) {
-    return protocolError("Upstream response has no body", 502);
+  if (!response.body)
+    return stream ? protocolError("Upstream response has no body", 502) : response;
+  if (!stream) {
+    // Inspect the prefix without waiting for an SSE connection to close.
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    const decoder = new TextDecoder();
+    let prefix = "";
+    const abort = () => {
+      void reader.cancel(signal?.reason).catch(() => {});
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      while (!prefix.trimStart()) {
+        signal?.throwIfAborted();
+        const chunk = await reader.read();
+        signal?.throwIfAborted();
+        if (chunk.done) break;
+        chunks.push(chunk.value);
+        prefix += decoder.decode(chunk.value, { stream: true });
+      }
+    } catch (error) {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+      throw error;
+    } finally {
+      signal?.removeEventListener("abort", abort);
+    }
+    stream = /^[deir:]/.test(prefix.trimStart());
+    response = new Response(
+      new ReadableStream<Uint8Array>(
+        {
+          start(controller) {
+            for (const chunk of chunks) controller.enqueue(chunk);
+          },
+          async pull(controller) {
+            try {
+              const chunk = await reader.read();
+              if (chunk.done) {
+                reader.releaseLock();
+                controller.close();
+              } else controller.enqueue(chunk.value);
+            } catch (error) {
+              reader.releaseLock();
+              controller.error(error);
+            }
+          },
+          async cancel(reason) {
+            await reader.cancel(reason);
+            reader.releaseLock();
+          },
+        },
+        { highWaterMark: 0 },
+      ),
+      { status: response.status, statusText: response.statusText, headers: response.headers },
+    );
+    if (!stream) return response;
   }
-  for await (const event of parseSSE(response.body, signal)) {
+  for await (const event of parseSSE(response.body!, signal)) {
     if (event.data === "[DONE]") {
       break;
     }

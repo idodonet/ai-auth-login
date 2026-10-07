@@ -20,6 +20,7 @@ export function countedFetch(
     stats.requestsSent++;
     let failed = false;
     let terminal = false;
+    let cancelled = false;
     const failOnce = () => {
       if (!failed) {
         failed = true;
@@ -37,7 +38,11 @@ export function countedFetch(
       }
       const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
       const reader = response.body.getReader();
-      const isSSE = response.headers.get("content-type")?.includes("text/event-stream");
+      let isSSE: boolean | undefined = response.headers
+        .get("content-type")
+        ?.includes("text/event-stream")
+        ? true
+        : undefined;
       const decoder = new TextDecoder();
       let pending = "";
       const onAbort = () => {
@@ -55,13 +60,18 @@ export function countedFetch(
         async pull(controller) {
           try {
             const chunk = await reader.read();
+            if (cancelled) return;
             if (chunk.done) {
               done();
               controller.close();
               return;
             }
-            if (isSSE) {
+            if (isSSE !== false) {
               pending += decoder.decode(chunk.value, { stream: true });
+              if (isSSE === undefined && pending.trimStart()) {
+                isSSE = /^[deir:]/.test(pending.trimStart());
+              }
+              if (isSSE === false) pending = "";
               const frames = pending.split(/\r?\n\r?\n/);
               pending = frames.pop() ?? "";
               // ponytail: cap incomplete SSE frames at 16 MiB; larger providers need configurable limits.
@@ -100,12 +110,14 @@ export function countedFetch(
             }
             controller.enqueue(chunk.value);
           } catch (error) {
+            if (cancelled) return;
             failOnce();
             done();
             controller.error(error);
           }
         },
         async cancel(reason) {
+          cancelled = true;
           if (!terminal) {
             failOnce();
           }

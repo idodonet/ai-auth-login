@@ -1,8 +1,44 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { countedFetch } from "../src/transport.js";
+import { normalizeResponsesResponse } from "../src/protocols/responses.js";
 
 const stats = () => ({ startedAt: new Date().toISOString(), requestsSent: 0, requestsFailed: 0 });
+test("collecting completed open SSE does not count reader cleanup as failure", async () => {
+  for (const contentType of [undefined, "application/json", "text/event-stream"]) {
+    for (const type of ["response.completed", "response.incomplete", "response.failed"]) {
+      const s = stats();
+      const data = new TextEncoder().encode(
+        `event: ${type}\ndata: ${JSON.stringify({ type, response: { id: "r", output: [], error: type === "response.failed" ? { message: "failed" } : undefined } })}\n\n`,
+      );
+      let cancelled = false;
+      const fetch = countedFetch(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                for (const byte of data) controller.enqueue(Uint8Array.of(byte));
+              },
+              cancel() {
+                cancelled = true;
+              },
+            }),
+            { headers: contentType ? { "content-type": contentType } : {} },
+          ),
+        s,
+      );
+      const response = await normalizeResponsesResponse(
+        await fetch("https://upstream.invalid"),
+        undefined,
+        true,
+      );
+      assert.equal(response.status, type === "response.failed" ? 502 : 200);
+      assert.equal(cancelled, true);
+      assert.equal(s.requestsSent, 1);
+      assert.equal(s.requestsFailed, type === "response.failed" ? 1 : 0);
+    }
+  }
+});
 test("counts HTTP, network and SSE errors once per attempt", async () => {
   const s = stats();
   const http = countedFetch(async () => new Response("failure", { status: 503 }), s);

@@ -1,6 +1,6 @@
 {
   "name": "ai-auth-login",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Use AI Subscription as OpenAI SDK adapter (Codex/Kimi/...)",
   "type": "module",
   "engines": {

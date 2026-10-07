@@ -506,7 +506,11 @@ export const codex: ProviderAdapter = {
     if (!response.ok || stream || path !== "/responses") {
       return response;
     }
-    return normalizeResponsesResponse(response, AbortSignal.any([request.signal, context.signal]));
+    return normalizeResponsesResponse(
+      response,
+      AbortSignal.any([request.signal, context.signal]),
+      true,
+    );
   },
 };
 export const createProvider = (): ProviderAdapter => codex;

@@ -71,7 +71,11 @@ export function connectAIStudioBrowser(
         signal: controller.signal,
       });
       const headers = Object.fromEntries(response.headers);
-      if (response.headers.get("content-type")?.includes("text/event-stream") && response.body) {
+      if (
+        response.body &&
+        (response.headers.get("content-type")?.includes("text/event-stream") ||
+          (response.ok && url.pathname.endsWith(":streamGenerateContent")))
+      ) {
         send(id, "stream_start", { status: response.status, headers });
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
