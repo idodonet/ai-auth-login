@@ -315,12 +315,11 @@ test("Responses thinking summary survives both JSON conversion directions", asyn
     () => responsesToChat({ input: [], reasoning: { summary: "detailed" } }),
     /summary=auto/,
   );
-  assert.throws(
-    () =>
-      responsesToChat({
-        input: [{ type: "reasoning", summary: [{ type: "summary_text", text: "thinking" }] }],
-      }),
-    /Unsupported Responses input/,
+  assert.deepEqual(
+    responsesToChat({
+      input: [{ type: "reasoning", summary: [{ type: "summary_text", text: "thinking" }] }],
+    }).messages,
+    [],
   );
 });
 test("real OpenAI SDK consumes default thinking responses through Gemini and Anthropic", async () => {

@@ -1,7 +1,7 @@
 import { ok, fail } from "../../result.js";
 import type { ProviderAdapter, CredentialState, ProviderContext } from "../contract.js";
 import type { ConnectCredentials, Model } from "../../types.js";
-import { executeGemini, executeInteractions } from "../../protocols/gemini.js";
+import { geminiCountBody, executeGemini, executeInteractions } from "../../protocols/gemini.js";
 
 const makeGemini = (interactions: boolean): ProviderAdapter => {
   const provider = interactions ? "gemini-interactions" : "gemini";
@@ -10,7 +10,13 @@ const makeGemini = (interactions: boolean): ProviderAdapter => {
       id: provider,
       name: interactions ? "Gemini Interactions" : "Gemini",
       authMethods: ["api-key"],
-      endpoints: ["models", "chat.completions", "responses"],
+      endpoints: [
+        "models",
+        "chat.completions",
+        "responses",
+        "count_tokens",
+        ...(interactions ? ["interactions" as const] : ["generateContent" as const]),
+      ],
       quota: false,
       modelDiscovery: "live",
     },
@@ -62,13 +68,14 @@ const makeGemini = (interactions: boolean): ProviderAdapter => {
     },
     listModels: discover,
     execute(request, state, context) {
-      const send = async (body: Record<string, unknown>, signal: AbortSignal) => {
+      const send = async (body: Record<string, unknown>, signal: AbortSignal, action?: "count") => {
         const model = String(body.model);
         const { model: _, stream: streamValue, ...payload } = body;
         const stream = streamValue === true;
-        const endpoint = interactions
-          ? "interactions"
-          : `models/${encodeURIComponent(model)}:${stream ? "streamGenerateContent?alt=sse" : "generateContent"}`;
+        const endpoint =
+          interactions && action !== "count"
+            ? "interactions"
+            : `models/${encodeURIComponent(model)}:${action === "count" ? "countTokens" : stream ? "streamGenerateContent?alt=sse" : "generateContent"}`;
         return context.fetch(`https://generativelanguage.googleapis.com/v1beta/${endpoint}`, {
           method: "POST",
           headers: {
@@ -76,11 +83,15 @@ const makeGemini = (interactions: boolean): ProviderAdapter => {
             "content-type": "application/json",
             ...(interactions ? { "Api-Revision": "2026-05-20" } : {}),
           },
-          body: JSON.stringify(interactions ? body : payload),
+          body: JSON.stringify(
+            action === "count" ? geminiCountBody(model, payload) : interactions ? body : payload,
+          ),
           signal,
         });
       };
-      return interactions ? executeInteractions(request, send) : executeGemini(request, send);
+      return interactions && !new URL(request.url).pathname.endsWith("count_tokens")
+        ? executeInteractions(request, send)
+        : executeGemini(request, send);
     },
   };
 };

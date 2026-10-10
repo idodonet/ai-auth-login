@@ -1,10 +1,14 @@
 import { executeResponses } from "./responses.js";
-import { protocolError, rejectFields, translatedHeaders } from "./openai.js";
+import { requestBody, protocolError, rejectFields, translatedHeaders } from "./openai.js";
 import { parseSSE, encodeSSE, streamSSE } from "./sse.js";
 
 // JSON wire payloads vary by upstream protocol.
 export type Wire = Record<string, any>;
-export type SendNative = (body: Record<string, unknown>, signal: AbortSignal) => Promise<Response>;
+export type SendNative = (
+  body: Record<string, unknown>,
+  signal: AbortSignal,
+  action?: "count",
+) => Promise<Response>;
 export const unsupported = protocolError;
 export const checkOptions = rejectFields;
 export function imageSource(url: string): Wire {
@@ -12,6 +16,18 @@ export function imageSource(url: string): Wire {
   return match ? { type: "base64", media_type: match[1], data: match[2] } : { type: "url", url };
 }
 export const streamResponse = streamSSE;
+const adaptiveModels = [
+  "claude-sonnet-4-6",
+  "claude-opus-4-6",
+  "claude-opus-4-7",
+  "claude-opus-4-8",
+  "claude-opus-5",
+  "claude-sonnet-5",
+  "claude-fable-5",
+  "claude-fable-5-1",
+  "claude-opus-5-5",
+  "claude-sonnet-5-5",
+];
 function nativeBody(body: Wire): Wire {
   checkOptions(body, [
     "model",
@@ -190,14 +206,21 @@ function nativeBody(body: Wire): Wire {
   }
   if (body.reasoning_effort) {
     const effort = body.reasoning_effort;
+    if (!["none", "auto", "minimal", "low", "medium", "high", "xhigh", "max"].includes(effort))
+      throw new Error("Unsupported Anthropic reasoning effort");
     if (effort === "none") {
       result.thinking = { type: "disabled" };
-    } else if (/4[.-]6/.test(body.model)) {
+    } else if (adaptiveModels.includes(body.model)) {
       result.thinking = { type: "adaptive" };
       if (effort !== "auto") {
         result.output_config = {
           ...result.output_config,
-          effort: effort === "minimal" ? "low" : effort === "xhigh" ? "high" : effort,
+          effort:
+            effort === "minimal"
+              ? "low"
+              : effort === "xhigh" && /4[.-]6/.test(body.model)
+                ? "high"
+                : effort,
         };
       }
     } else {
@@ -441,8 +464,51 @@ export async function executeAnthropic(
   request: Request,
   sendNative: SendNative,
 ): Promise<Response> {
-  if (new URL(request.url).pathname.endsWith("/responses")) {
-    return executeResponses(request, (body, signal) => convert(body, sendNative, signal));
+  const path = new URL(request.url).pathname;
+  if (request.method !== "POST") return unsupported("Unsupported Anthropic method", 405);
+  if (path === "/v1/responses" || path === "/v1/responses/compact") {
+    return executeResponses(request, (body, signal) => convert(body, sendNative, signal), true);
   }
-  return convert((await request.json()) as Wire, sendNative, request.signal);
+  if (
+    ![
+      "/v1/messages",
+      "/v1/messages/count_tokens",
+      "/v1/chat/completions/count_tokens",
+      "/v1/chat/completions",
+    ].includes(path)
+  )
+    return unsupported("Unsupported Anthropic endpoint", 404);
+  const body = await requestBody(request);
+  if (body instanceof Response) return body;
+  if (path === "/v1/messages") return sendNative(body, request.signal);
+  if (path === "/v1/messages/count_tokens") return sendNative(body, request.signal, "count");
+  if (path === "/v1/chat/completions/count_tokens") {
+    let native: Wire;
+    try {
+      const countInput = { ...body };
+      for (const key of [
+        "reasoning_effort",
+        "max_tokens",
+        "max_completion_tokens",
+        "stream",
+        "stream_options",
+      ])
+        delete countInput[key];
+      native = nativeBody(countInput);
+    } catch (error) {
+      return unsupported(error instanceof Error ? error.message : "Invalid count request");
+    }
+    for (const key of [
+      "max_tokens",
+      "stream",
+      "thinking",
+      "output_config",
+      "temperature",
+      "top_p",
+      "stop_sequences",
+    ])
+      delete native[key];
+    return sendNative(native, request.signal, "count");
+  }
+  return convert(body, sendNative, request.signal);
 }

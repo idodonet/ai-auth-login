@@ -1,3 +1,4 @@
+import { collectGeminiStream } from "../../protocols/gemini.js";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { fail, ok } from "../../result.js";
@@ -5,6 +6,7 @@ import type { Result } from "../../types.js";
 import type { CredentialState, JsonValue, ProviderAdapter, ProviderContext } from "../contract.js";
 import { executeGemini } from "../../protocols/gemini.js";
 import { createOAuthSession, createPKCE } from "../../auth/oauth.js";
+import { quota, quotaJSON, record, number, percent, timestamp, window } from "../quota.js";
 
 const clientId = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 // Public installed-application client credentials from CLIProxyAPI, not an account secret.
@@ -215,8 +217,15 @@ export const antigravity: ProviderAdapter = {
     id: "antigravity",
     name: "Antigravity",
     authMethods: ["callback"],
-    endpoints: ["models", "chat.completions", "responses"],
-    quota: false,
+    endpoints: [
+      "models",
+      "chat.completions",
+      "responses",
+      "count_tokens",
+      "generateContent",
+      "responses.compact",
+    ],
+    quota: true,
     modelDiscovery: "live",
   },
   async beginAuth(context, options) {
@@ -327,8 +336,58 @@ export const antigravity: ProviderAdapter = {
       lastAuthenticatedAt: state.authenticatedAt,
     });
   },
-  async getQuota() {
-    return ok({ supported: false, checkedAt: new Date().toISOString(), windows: [] });
+  async getQuota(state, context) {
+    const token = text(state.credentials.accessToken),
+      projectId = text(state.credentials.project);
+    if (!token || !projectId) return fail("auth-required", "Sign in to Antigravity first.");
+    let last: Awaited<ReturnType<typeof quotaJSON>> | undefined;
+    for (const endpoint of [
+      daily,
+      "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:",
+      prod,
+    ]) {
+      const result = await quotaJSON(context, `${endpoint}retrieveUserQuotaSummary`, {
+        method: "POST",
+        headers: {
+          ...headers(token),
+          "user-agent": "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)",
+        },
+        body: JSON.stringify({ project: projectId }),
+      });
+      last = result;
+      if (!result.ok) {
+        if (context.signal.aborted) return result;
+        continue;
+      }
+      if (!Array.isArray(result.value.groups)) continue;
+      const windows = result.value.groups.flatMap((value) => {
+        const group = record(value);
+        return (Array.isArray(group.buckets) ? group.buckets : []).flatMap((value) => {
+          const bucket = record(value),
+            fraction = number(bucket.remainingFraction ?? bucket.remaining_fraction);
+          if (fraction === null) return [];
+          const period = String(bucket.window ?? "");
+          return [
+            window(
+              `${group.displayName ?? group.display_name ?? "quota"}: ${bucket.displayName ?? bucket.display_name ?? period}`,
+              {
+                remainingPercent: percent(fraction * 100),
+                resetsAt: timestamp(bucket.resetTime ?? bucket.reset_time),
+                durationSeconds: ["5h", "five-hour", "five_hour"].includes(period)
+                  ? 18000
+                  : ["weekly", "week"].includes(period)
+                    ? 604800
+                    : null,
+              },
+            ),
+          ];
+        });
+      });
+      return quota(windows);
+    }
+    return last && !last.ok
+      ? last
+      : fail("provider-error", "Antigravity returned no quota groups.");
   },
   async listModels(state, context) {
     const data = await modelData(state, context);
@@ -360,26 +419,38 @@ export const antigravity: ProviderAdapter = {
         { status: 401 },
       );
     }
-    const streaming = ((await request.clone().json()) as { stream?: boolean }).stream === true;
-    return executeGemini(request, async (body, signal) => {
-      const { model, stream: _stream, ...native } = body;
-      return context.fetch(
-        `${daily}${streaming ? "streamGenerateContent?alt=sse" : "generateContent"}`,
-        {
-          method: "POST",
-          headers: headers(token),
-          signal: AbortSignal.any([signal, context.signal]),
-          body: JSON.stringify({
-            project: projectId,
-            model,
-            userAgent: "antigravity",
-            requestType: String(model).includes("image") ? "image_gen" : "agent",
-            requestId: randomUUID(),
-            request: native,
-          }),
-        },
-      );
-    });
+    return executeGemini(
+      request,
+      async (body, signal, action) => {
+        const { model, stream, ...native } = body;
+        const collect =
+          action !== "count" &&
+          !stream &&
+          /claude|gemini-3-pro|gemini-3\.1-flash-image/.test(String(model));
+        const response = await context.fetch(
+          `${daily}${action === "count" ? "countTokens" : stream || collect ? "streamGenerateContent?alt=sse" : "generateContent"}`,
+          {
+            method: "POST",
+            headers: headers(token),
+            signal: AbortSignal.any([signal, context.signal]),
+            body: JSON.stringify(
+              action === "count"
+                ? { request: native }
+                : {
+                    project: projectId,
+                    model,
+                    userAgent: "antigravity",
+                    requestType: String(model).includes("image") ? "image_gen" : "agent",
+                    requestId: randomUUID(),
+                    request: native,
+                  },
+            ),
+          },
+        );
+        return collect && response.ok ? collectGeminiStream(response, signal) : response;
+      },
+      true,
+    );
   },
 };
 

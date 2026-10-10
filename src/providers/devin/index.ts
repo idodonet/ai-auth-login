@@ -1,3 +1,4 @@
+import { estimateTokens } from "../../protocols/tokens.js";
 import { createHash, randomUUID } from "node:crypto";
 import { authLifetime, createPKCE } from "../../auth/oauth.js";
 import type { CredentialState, ProviderAdapter, ProviderContext } from "../contract.js";
@@ -319,7 +320,7 @@ export const devin: ProviderAdapter = {
     id: "devin",
     name: "Devin",
     authMethods: ["callback", "api-key"],
-    endpoints: ["models", "chat.completions", "responses"],
+    endpoints: ["models", "chat.completions", "responses", "count_tokens"],
     quota: true,
     modelDiscovery: "catalog",
   },
@@ -486,6 +487,12 @@ export const devin: ProviderAdapter = {
     );
   },
   async execute(request, state, context) {
+    if (
+      ["/v1/chat/completions/count_tokens", "/v1/messages/count_tokens"].includes(
+        new URL(request.url).pathname,
+      )
+    )
+      return estimateTokens(request);
     return execute(request, state, context);
   },
 };

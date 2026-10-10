@@ -1,4 +1,6 @@
+import type WebSocket from "ws";
 import OpenAI from "openai";
+import { responsesToChat } from "./protocols/responses.js";
 import { fail, ok } from "./result.js";
 import { decodeState, encodeState } from "./state.js";
 import { countedFetch, errorResponse, ownResponse } from "./transport.js";
@@ -25,6 +27,7 @@ import type {
   SavedState,
   SDKOptions,
   SessionStats,
+  TokenCount,
 } from "./types.js";
 
 export class ProviderSession {
@@ -447,6 +450,72 @@ export class ProviderSession {
   }
   async listModels(): Promise<Result<readonly Model[]>> {
     return this.read((adapter, state, context) => adapter.listModels(state, context));
+  }
+
+  async openResponsesSocket(options: { signal?: AbortSignal } = {}): Promise<Result<WebSocket>> {
+    const auth = await this.checkCredentials(undefined, { validate: false });
+    if (!auth.ok) return auth;
+    if (!auth.value.valid || !this.state)
+      return fail("auth-required", "Authenticate this session first.");
+    const generation = this.generation;
+    const state = structuredClone(this.state),
+      adapter = this.getAdapter(state.provider)!;
+    if (!adapter.openResponsesSocket)
+      return fail("unsupported", "This provider has no Responses WebSocket transport.");
+    const operation = this.context(undefined, options.signal);
+    const result = await this.safe(
+      () => adapter.openResponsesSocket!(state, operation.context),
+      operation.context.signal,
+    );
+    const stale = this.stale(generation);
+    if (!result.ok || stale) {
+      if (result.ok) result.value.terminate();
+      operation.finish();
+      return stale ?? result;
+    }
+    if (result.value.readyState === result.value.CLOSED) operation.finish();
+    else result.value.once("close", operation.finish);
+    return result;
+  }
+
+  async countTokens(
+    input:
+      | OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming
+      | OpenAI.Responses.ResponseCreateParamsNonStreaming,
+  ): Promise<Result<TokenCount>> {
+    return this.read(async (adapter, state, context) => {
+      let body: typeof input | Record<string, unknown>;
+      try {
+        body = "input" in input ? responsesToChat(input) : input;
+      } catch {
+        return fail("unsupported", "Unsupported token-count input.");
+      }
+      const response = await adapter.execute(
+        new Request("https://provider-session.invalid/v1/chat/completions/count_tokens", {
+          method: "POST",
+          body: JSON.stringify(body),
+          signal: context.signal,
+        }),
+        state,
+        context,
+      );
+      if (!response.ok)
+        return fail(
+          response.status === 404
+            ? "unsupported"
+            : response.status === 401 || response.status === 403
+              ? "auth-required"
+              : response.status === 429
+                ? "rate-limited"
+                : "provider-error",
+          "Token counting failed.",
+          response.status === 429 || response.status >= 500,
+        );
+      const value = (await response.json()) as { input_tokens?: unknown; estimated?: boolean };
+      if (!Number.isSafeInteger(value.input_tokens) || Number(value.input_tokens) < 0)
+        return fail("provider-error", "Invalid upstream token count.");
+      return ok({ inputTokens: Number(value.input_tokens), estimated: value.estimated === true });
+    });
   }
 
   async createSDK(options: SDKOptions = {}): Promise<Result<OpenAI>> {

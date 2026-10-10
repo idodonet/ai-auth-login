@@ -1,3 +1,6 @@
+import { connectResponsesSocket } from "../../protocols/websocket.js";
+import { executeSpeech } from "./speech.js";
+import { estimateTokens } from "../../protocols/tokens.js";
 import { executeVideo } from "./videos.js";
 import { createDeviceSession } from "../../auth/device.js";
 import { fail, ok } from "../../result.js";
@@ -5,6 +8,7 @@ import type { Result } from "../../types.js";
 import type { CredentialState, ProviderAdapter, ProviderContext } from "../contract.js";
 import { executeOpenAI, protocolError } from "../../protocols/openai.js";
 import { executeChat, normalizeResponsesResponse } from "../../protocols/responses.js";
+import { quota, quotaJSON, record, number, percent, timestamp, window } from "../quota.js";
 
 const clientID = "b1a00492-073a-47ea-816f-4c329264a828";
 const scope = "openid profile email offline_access grok-cli:access api:access";
@@ -118,8 +122,18 @@ export const xai: ProviderAdapter = {
     id: "xai",
     name: "xAI",
     authMethods: ["device", "api-key"],
-    endpoints: ["models", "chat.completions", "responses", "images", "videos"],
-    quota: false,
+    endpoints: [
+      "models",
+      "chat.completions",
+      "responses",
+      "images",
+      "videos",
+      "count_tokens",
+      "responses.compact",
+      "responses.websocket",
+      "audio",
+    ],
+    quota: true,
     modelDiscovery: "catalog",
   },
   async beginAuth(context, options) {
@@ -283,13 +297,112 @@ export const xai: ProviderAdapter = {
       lastAuthenticatedAt: state.authenticatedAt,
     });
   },
-  async getQuota() {
-    return ok({ supported: false, checkedAt: new Date().toISOString(), windows: [] });
+  async getQuota(state, context) {
+    if (state.credentials.apiKey) return quota([], false);
+    const token = state.credentials.accessToken;
+    if (typeof token !== "string" || !token) return fail("auth-required", "xAI login is required.");
+    const h: Record<string, string> = {
+      Authorization: `Bearer ${token}`,
+      "x-xai-token-auth": "xai-grok-cli",
+      "x-grok-client-version": "0.2.91",
+      "user-agent": "grok-pager/0.2.91 grok-shell/0.2.91 (macos; aarch64)",
+      accept: "*/*",
+    };
+    if (typeof state.credentials.subject === "string") h["x-userid"] = state.credentials.subject;
+    const results = await Promise.all(
+      ["?format=credits", ""].map((suffix) =>
+        quotaJSON(context, `https://cli-chat-proxy.grok.com/v1/billing${suffix}`, { headers: h }),
+      ),
+    );
+    const windows = results.flatMap((result, index) => {
+      if (!result.ok) return [];
+      const config = record(result.value.config),
+        period = record(config.currentPeriod ?? config.current_period);
+      const usedPercent = number(config.creditUsagePercent ?? config.credit_usage_percent);
+      if (index === 0) {
+        const resetsAt = timestamp(
+          period.end ?? config.billingPeriodEnd ?? config.billing_period_end,
+        );
+        const start = timestamp(period.start);
+        const durationSeconds =
+          start && resetsAt && Date.parse(resetsAt) > Date.parse(start)
+            ? (Date.parse(resetsAt) - Date.parse(start)) / 1000
+            : null;
+        const products = config.productUsage ?? config.product_usage;
+        return [
+          window(String(period.type ?? "weekly"), {
+            durationSeconds,
+            remainingPercent: percent(usedPercent === null ? null : 100 - usedPercent),
+            resetsAt,
+          }),
+          ...(Array.isArray(products)
+            ? products.map((value) => {
+                const product = record(value),
+                  used = number(product.usagePercent ?? product.usage_percent);
+                return window(String(product.product ?? "product"), {
+                  remainingPercent: percent(used === null ? null : 100 - used),
+                  resetsAt,
+                  durationSeconds,
+                });
+              })
+            : []),
+        ];
+      }
+      const cents = (value: unknown) => number(record(value).val ?? value);
+      const limit = cents(config.monthlyLimit ?? config.monthly_limit),
+        used = cents(config.used);
+      const cap = cents(config.onDemandCap ?? config.on_demand_cap);
+      const extra =
+        cents(config.onDemandUsed ?? config.on_demand_used) ??
+        (used !== null && limit !== null ? Math.max(0, used - limit) : null);
+      const end = timestamp(config.billingPeriodEnd ?? config.billing_period_end);
+      const balance = cents(config.prepaidBalance ?? config.prepaid_balance);
+      return [
+        window("monthly", {
+          limit,
+          remaining: limit !== null && used !== null ? Math.max(0, limit - used) : null,
+          remainingPercent:
+            limit !== null && limit > 0 && used !== null
+              ? percent(100 - (used / limit) * 100)
+              : null,
+          unit: "usd-cents",
+          resetsAt: end,
+        }),
+        ...(cap === null
+          ? []
+          : [
+              window("on-demand", {
+                limit: cap,
+                remaining: extra === null ? null : Math.max(0, cap - extra),
+                remainingPercent:
+                  cap > 0 && extra !== null ? percent(100 - (extra / cap) * 100) : null,
+                unit: "usd-cents",
+                resetsAt: end,
+              }),
+            ]),
+        ...(balance === null ? [] : [window("prepaid", { remaining: balance, unit: "usd-cents" })]),
+      ];
+    });
+    if (results.every((result) => !result.ok)) return results[0];
+    return quota(windows);
   },
   async listModels() {
     return ok(models.map((id) => ({ id, object: "model" as const, created: 0, owned_by: "xai" })));
   },
+  async openResponsesSocket(state, context) {
+    const token = state.credentials.apiKey ?? state.credentials.accessToken;
+    if (typeof token !== "string" || !token)
+      return fail("auth-required", "xAI authentication required.");
+    const h = new Headers({ Authorization: `Bearer ${token}`, "Content-Type": "application/json" });
+    return connectResponsesSocket("https://api.x.ai/v1", h, context.signal);
+  },
   async execute(request, state, context) {
+    if (
+      ["/v1/chat/completions/count_tokens", "/v1/messages/count_tokens"].includes(
+        new URL(request.url).pathname,
+      )
+    )
+      return estimateTokens(request);
     const path = new URL(request.url).pathname.replace(/^\/v1/, "");
     const apiKey = typeof state.credentials.apiKey === "string" ? state.credentials.apiKey : null;
     const token = apiKey ?? state.credentials.accessToken;
@@ -307,6 +420,24 @@ export const xai: ProviderAdapter = {
       headers.set("x-grok-client-identifier", "grok-shell");
       headers.set("x-authenticateresponse", "authenticate-response");
       headers.set("User-Agent", "xai-grok-workspace/1.0.44");
+    }
+    if (path === "/audio/speech" || path === "/tts")
+      return executeSpeech(
+        request,
+        new Headers({ Authorization: `Bearer ${token}`, "Content-Type": "application/json" }),
+        context,
+      );
+    if (path === "/responses/compact") {
+      if (request.method !== "POST") return protocolError("Compaction requires POST", 405);
+      const body = (await request.json()) as Record<string, unknown>;
+      if (body.stream) return protocolError("Streaming compact is unsupported");
+      return context.fetch("https://api.x.ai/v1/responses/compact", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.any([request.signal, context.signal]),
+        redirect: "error",
+      });
     }
     if (path === "/videos" || path.startsWith("/videos/")) {
       return executeVideo(request, base, headers, context);

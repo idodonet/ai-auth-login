@@ -1,9 +1,12 @@
+import { connectResponsesSocket } from "../../protocols/websocket.js";
+import { estimateTokens } from "../../protocols/tokens.js";
 import { executeImages } from "./images.js";
 import { createPKCE, createOAuthSession } from "../../auth/oauth.js";
 import { createDeviceSession } from "../../auth/device.js";
 import { executeChat, normalizeResponsesResponse } from "../../protocols/responses.js";
 import type { ProviderAdapter, CredentialState, ProviderContext, JsonValue } from "../contract.js";
 import type { Result, QuotaWindow, Model } from "../../types.js";
+import { number, timestamp, window } from "../quota.js";
 import { ok, fail } from "../../result.js";
 import { protocolError } from "../../protocols/openai.js";
 
@@ -145,7 +148,15 @@ export const codex: ProviderAdapter = {
     id: "codex",
     name: "Codex",
     authMethods: ["callback", "device", "api-key"],
-    endpoints: ["models", "responses", "chat.completions", "images"],
+    endpoints: [
+      "models",
+      "responses",
+      "chat.completions",
+      "images",
+      "count_tokens",
+      "responses.compact",
+      "responses.websocket",
+    ],
     quota: true,
     modelDiscovery: "live",
   },
@@ -367,8 +378,7 @@ export const codex: ProviderAdapter = {
           remaining: null,
           limit: null,
           unit: null,
-          resetsAt:
-            reset === null || !Number.isFinite(reset) ? null : new Date(reset).toISOString(),
+          resetsAt: reset === null ? null : timestamp(reset / 1000),
         });
       }
     };
@@ -379,6 +389,8 @@ export const codex: ProviderAdapter = {
         add(limit.rate_limit, str(limit.limit_name));
       }
     }
+    const balance = number(result.value.credits?.balance);
+    if (balance !== null) windows.push(window("credits", { remaining: balance, unit: "credits" }));
     return ok({ supported: true, checkedAt: new Date().toISOString(), windows });
   },
   async listModels(state, context) {
@@ -410,7 +422,20 @@ export const codex: ProviderAdapter = {
       }),
     );
   },
+  async openResponsesSocket(state, context) {
+    const url = endpoint(state);
+    if (!url) return fail("invalid-state", "Invalid Codex endpoint.");
+    const h = headers(state);
+    h.set("OpenAI-Beta", "responses_websockets=2026-02-06");
+    return connectResponsesSocket(url, h, context.signal);
+  },
   async execute(request, state, context) {
+    if (
+      ["/v1/chat/completions/count_tokens", "/v1/messages/count_tokens"].includes(
+        new URL(request.url).pathname,
+      )
+    )
+      return estimateTokens(request);
     const url = endpoint(state);
     if (!url) {
       return protocolError("Invalid Codex endpoint");

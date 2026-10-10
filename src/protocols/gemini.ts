@@ -1,5 +1,5 @@
 import { executeResponses } from "./responses.js";
-import { translatedHeaders } from "./openai.js";
+import { requestBody, translatedHeaders } from "./openai.js";
 import { parseSSE, encodeSSE } from "./sse.js";
 import { checkOptions, imageSource, unsupported, streamResponse } from "./anthropic.js";
 import type { Wire, SendNative } from "./anthropic.js";
@@ -485,11 +485,70 @@ async function convert(body: Wire, sendNative: SendNative, signal: AbortSignal):
   }
   return streamResponse(events(), response, () => cancellation.abort());
 }
-export async function executeGemini(request: Request, sendNative: SendNative): Promise<Response> {
-  if (new URL(request.url).pathname.endsWith("/responses")) {
-    return executeResponses(request, (body, signal) => convert(body, sendNative, signal));
+export async function executeGemini(
+  request: Request,
+  sendNative: SendNative,
+  allowCompact = false,
+): Promise<Response> {
+  const path = new URL(request.url).pathname;
+  if (request.method !== "POST") return unsupported("Unsupported Gemini method", 405);
+  const native =
+    /^\/(?:v1|v1beta)\/models\/([^/]+):(generateContent|streamGenerateContent|countTokens)$/.exec(
+      path,
+    );
+  if (path === "/v1/responses" || (allowCompact && path === "/v1/responses/compact")) {
+    return executeResponses(
+      request,
+      (body, signal) => convert(body, sendNative, signal),
+      allowCompact,
+    );
   }
-  return convert((await request.json()) as Wire, sendNative, request.signal);
+  if (
+    !native &&
+    ![
+      "/v1/chat/completions",
+      "/v1/chat/completions/count_tokens",
+      "/v1/messages/count_tokens",
+    ].includes(path)
+  )
+    return unsupported("Unsupported Gemini endpoint", 404);
+  const body = await requestBody(request);
+  if (body instanceof Response) return body;
+  if (native) {
+    return sendNative(
+      {
+        ...body,
+        model: decodeURIComponent(native[1]!),
+        stream: native[2] === "streamGenerateContent",
+      },
+      request.signal,
+      native[2] === "countTokens" ? "count" : undefined,
+    );
+  }
+  if (path.endsWith("/count_tokens")) {
+    let translated: Wire;
+    try {
+      translated = nativeBody(body);
+    } catch (error) {
+      return unsupported(error instanceof Error ? error.message : "Invalid count request");
+    }
+    delete translated.stream;
+    delete translated.generationConfig;
+    const response = await sendNative(translated, request.signal, "count");
+    if (!response.ok) return response;
+    try {
+      const value = (await response.json()) as Wire;
+      const tokens = (value.response ?? value).totalTokens;
+      if (!Number.isSafeInteger(tokens) || tokens < 0) throw new Error("Invalid count");
+      return Response.json(
+        { input_tokens: tokens, estimated: false },
+        { headers: translatedHeaders(response) },
+      );
+    } catch {
+      return unsupported("Invalid upstream token count", 502);
+    }
+  }
+  return convert(body, sendNative, request.signal);
 }
 
 function interactionsBody(body: Wire): Wire {
@@ -822,10 +881,77 @@ export async function executeInteractions(
   request: Request,
   sendNative: SendNative,
 ): Promise<Response> {
-  if (new URL(request.url).pathname.endsWith("/responses")) {
+  const path = new URL(request.url).pathname;
+  if (request.method !== "POST") return unsupported("Unsupported Interactions method", 405);
+  if (path === "/v1/responses")
     return executeResponses(request, (body, signal) =>
       convertInteractions(body, sendNative, signal),
     );
+  if (!["/v1beta/interactions", "/v1/interactions", "/v1/chat/completions"].includes(path))
+    return unsupported("Unsupported Interactions endpoint", 404);
+  const body = await requestBody(request);
+  if (body instanceof Response) return body;
+  if (path !== "/v1/chat/completions") return sendNative(body, request.signal);
+  return convertInteractions(body, sendNative, request.signal);
+}
+
+/** The Antigravity Claude/image backend streams even for a non-stream caller. */
+export async function collectGeminiStream(
+  response: Response,
+  signal: AbortSignal,
+): Promise<Response> {
+  if (!response.body) throw new Error("Gemini stream has no body");
+  const candidates = new Map<number, Wire>();
+  let result: Wire = {},
+    envelope: Wire = {},
+    wrapped = false;
+  for await (const event of parseSSE(response.body, signal)) {
+    if (event.data === "[DONE]") continue;
+    const value = JSON.parse(event.data) as Wire;
+    if (value.error)
+      return Response.json(value, { status: 502, headers: translatedHeaders(response) });
+    wrapped ||= !!value.response;
+    envelope = { ...envelope, ...value };
+    const native = value.response ?? value;
+    result = { ...result, ...native };
+    for (const candidate of native.candidates ?? []) {
+      const index = candidate.index ?? 0;
+      const prior = candidates.get(index);
+      const parts = [...(prior?.content?.parts ?? [])];
+      for (const part of candidate.content?.parts ?? []) {
+        const last = parts.at(-1);
+        if (
+          typeof part.text === "string" &&
+          last &&
+          typeof last.text === "string" &&
+          !!part.thought === !!last.thought &&
+          !last.thoughtSignature
+        ) {
+          const text = last.text + part.text;
+          Object.assign(last, part, { text });
+        } else parts.push({ ...part });
+      }
+      candidates.set(index, {
+        ...prior,
+        ...candidate,
+        content: { ...prior?.content, ...candidate.content, parts },
+      });
+    }
   }
-  return convertInteractions((await request.json()) as Wire, sendNative, request.signal);
+  if (!candidates.size || [...candidates.values()].some((candidate) => !candidate.finishReason)) {
+    throw new Error("Gemini stream ended before completion");
+  }
+  result.candidates = [...candidates.values()];
+  return Response.json(wrapped ? { ...envelope, response: result } : result, {
+    headers: translatedHeaders(response),
+  });
+}
+
+export function geminiCountBody(model: string, payload: Wire): Wire {
+  if (
+    payload.generateContentRequest ||
+    !["systemInstruction", "tools", "toolConfig"].some((key) => key in payload)
+  )
+    return payload;
+  return { generateContentRequest: { ...payload, model: `models/${model}` } };
 }

@@ -34,3 +34,14 @@ export function translatedHeaders(response: Response): Headers {
   headers.set("content-type", "application/json");
   return headers;
 }
+
+export async function requestBody(request: Request): Promise<JSONBody | Response> {
+  try {
+    const body: unknown = await request.json();
+    if (!body || typeof body !== "object" || Array.isArray(body))
+      return protocolError("Request body must be a JSON object");
+    return body;
+  } catch {
+    return protocolError("Invalid request JSON");
+  }
+}

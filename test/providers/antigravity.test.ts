@@ -80,8 +80,19 @@ test("Antigravity refresh preserves rotating credentials and rejects malformed s
   assert.equal(account.value?.isFree, true);
 });
 
-test("Antigravity models use the live map; quota stays explicitly unknown", async () => {
+test("Antigravity models use the live map and quota uses the quota summary", async () => {
   const ctx = context((url) => {
+    if (url.endsWith(":retrieveUserQuotaSummary"))
+      return Response.json({
+        groups: [
+          {
+            displayName: "Gemini",
+            buckets: [
+              { window: "weekly", remainingFraction: 0, resetTime: "2026-10-17T00:00:00Z" },
+            ],
+          },
+        ],
+      });
     assert.ok(url.endsWith(":fetchAvailableModels"));
     return Response.json({ models: { "gemini-model": { displayName: "Gemini" } } });
   });
@@ -90,8 +101,9 @@ test("Antigravity models use the live map; quota stays explicitly unknown", asyn
   assert.equal(models.value[0]?.id, "gemini-model");
   const quota = await antigravity.getQuota(state, ctx);
   assert.ok(quota.ok);
-  assert.equal(quota.value.supported, false);
-  assert.deepEqual(quota.value.windows, []);
+  assert.equal(quota.value.supported, true);
+  assert.equal(quota.value.windows[0].remainingPercent, 0);
+  assert.equal(quota.value.windows[0].durationSeconds, 604800);
 });
 
 test("Antigravity wraps native Gemini requests and unwraps responses", async () => {

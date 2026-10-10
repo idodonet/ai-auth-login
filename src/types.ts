@@ -80,7 +80,7 @@ export interface QuotaWindow {
   remainingPercent: number | null;
   remaining: number | null;
   limit: number | null;
-  unit: "requests" | "tokens" | "credits" | null;
+  unit: "requests" | "tokens" | "credits" | "usd-cents" | null;
   resetsAt: string | null;
 }
 export interface Quota {
@@ -95,7 +95,19 @@ export interface SessionStats {
 }
 export type AuthMethod = "callback" | "device" | "api-key" | "service-account" | "relay";
 export type Endpoint =
-  "models" | "chat.completions" | "responses" | "embeddings" | "images" | "audio" | "videos";
+  | "models"
+  | "chat.completions"
+  | "responses"
+  | "embeddings"
+  | "images"
+  | "audio"
+  | "videos"
+  | "count_tokens"
+  | "messages"
+  | "generateContent"
+  | "interactions"
+  | "responses.compact"
+  | "responses.websocket";
 export interface ProviderDescriptor {
   id: Provider;
   name: string;
@@ -125,4 +137,10 @@ export type Model = OpenAI.Model;
 export interface RelayConnection {
   url: string;
   token: string;
+}
+
+export interface TokenCount {
+  inputTokens: number;
+  /** Local BPE estimates exclude multimodal tokens and protocol overhead. */
+  estimated: boolean;
 }

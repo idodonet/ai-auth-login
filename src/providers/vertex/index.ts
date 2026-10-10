@@ -10,7 +10,7 @@ export const vertex: ProviderAdapter = {
     id: "vertex",
     name: "Vertex AI",
     authMethods: ["api-key", "service-account"],
-    endpoints: ["models", "chat.completions", "responses"],
+    endpoints: ["models", "chat.completions", "responses", "count_tokens", "generateContent"],
     quota: false,
     modelDiscovery: "catalog",
   },
@@ -230,11 +230,11 @@ export const vertex: ProviderAdapter = {
       typeof c.apiKey === "string"
         ? { "x-goog-api-key": c.apiKey }
         : { Authorization: `Bearer ${String(c.accessToken)}` };
-    return executeGemini(request, async (body, signal) => {
+    return executeGemini(request, async (body, signal, action) => {
       const { model, stream: streamValue, ...payload } = body;
       const stream = streamValue === true;
       return context.fetch(
-        `${baseURL}/models/${encodeURIComponent(String(model))}:${stream ? "streamGenerateContent?alt=sse" : "generateContent"}`,
+        `${baseURL}/models/${encodeURIComponent(String(model))}:${action === "count" ? "countTokens" : stream ? "streamGenerateContent?alt=sse" : "generateContent"}`,
         {
           method: "POST",
           headers: { ...headers, "content-type": "application/json" },

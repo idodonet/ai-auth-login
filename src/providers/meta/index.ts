@@ -1,9 +1,11 @@
+import { estimateTokens } from "../../protocols/tokens.js";
 import { createDeviceSession } from "../../auth/device.js";
 import { ok, fail } from "../../result.js";
 import type { CredentialState, ProviderAdapter, ProviderContext } from "../contract.js";
 import type { Result } from "../../types.js";
 import { executeChat } from "../../protocols/responses.js";
 import { executeOpenAI, protocolError } from "../../protocols/openai.js";
+import { quota, quotaJSON, record, number, percent, timestamp, window } from "../quota.js";
 
 const baseURL = "https://api.meta.ai/v1";
 const clientID = "1031625952748946";
@@ -81,8 +83,8 @@ export const meta: ProviderAdapter = {
     id: "meta",
     name: "Meta",
     authMethods: ["device", "api-key"],
-    endpoints: ["models", "responses", "chat.completions"],
-    quota: false,
+    endpoints: ["models", "responses", "chat.completions", "count_tokens"],
+    quota: true,
     modelDiscovery: "catalog",
   },
   async beginAuth(context, options) {
@@ -190,13 +192,45 @@ export const meta: ProviderAdapter = {
       lastAuthenticatedAt: state.authenticatedAt,
     });
   },
-  async getQuota() {
-    return ok({ supported: false, checkedAt: new Date().toISOString(), windows: [] });
+  async getQuota(state, context) {
+    const token = state.credentials.dcaToken;
+    if (typeof token !== "string" || !token) return quota([], false);
+    const result = await quotaJSON(context, "https://api.meta.ai/muse-code/key", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "x-api-version": "1.0.0",
+      },
+      body: "{}",
+    });
+    if (!result.ok) return result;
+    const usage = record(result.value.subs_usage);
+    return quota(
+      ["window", "weekly"].map((name) => {
+        const value = record(usage[name]),
+          used = number(value.used_percent);
+        const minutes = number(value.window_duration_mins);
+        return window(name, {
+          remainingPercent: percent(used === null ? null : 100 - used),
+          durationSeconds:
+            name === "weekly" ? 604800 : minutes !== null && minutes > 0 ? minutes * 60 : null,
+          resetsAt: timestamp(number(value.resets_at)),
+        });
+      }),
+    );
   },
   async listModels() {
     return ok(models);
   },
   async execute(request, state, context) {
+    if (
+      ["/v1/chat/completions/count_tokens", "/v1/messages/count_tokens"].includes(
+        new URL(request.url).pathname,
+      )
+    )
+      return estimateTokens(request);
     const url = trustedURL(state.credentials.baseURL);
     if (!url || typeof state.credentials.apiKey !== "string") {
       return protocolError("Meta credentials are invalid.", 401);

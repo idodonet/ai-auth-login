@@ -1,6 +1,6 @@
 {
   "name": "ai-auth-login",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Use AI Subscription as OpenAI SDK adapter (Codex/Kimi/...)",
   "type": "module",
   "engines": {
@@ -40,12 +40,13 @@
   },
   "license": "MIT",
   "dependencies": {
+    "@types/ws": "^8.18.2",
+    "js-tiktoken": "^1.0.21",
     "openai": "^6.0.0",
     "ws": "^8.21.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "@types/ws": "^8.18.1",
     "prettier": "3.9.9",
     "semantic-release": "^25.0.9",
     "typescript": "^5.9.0"

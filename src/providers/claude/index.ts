@@ -3,6 +3,15 @@ import type { Result } from "../../types.js";
 import type { ProviderAdapter, CredentialState, ProviderContext, JsonValue } from "../contract.js";
 import { executeAnthropic } from "../../protocols/anthropic.js";
 import { createPKCE, createOAuthSession } from "../../auth/oauth.js";
+import {
+  quota,
+  quotaJSON,
+  record as quotaRecord,
+  number,
+  percent,
+  timestamp,
+  window,
+} from "../quota.js";
 
 const clientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const redirectURI = "http://localhost:54545/callback";
@@ -104,8 +113,15 @@ export const claude: ProviderAdapter = {
     id: "claude",
     name: "Claude",
     authMethods: ["callback", "api-key"],
-    endpoints: ["models", "chat.completions", "responses"],
-    quota: false,
+    endpoints: [
+      "models",
+      "chat.completions",
+      "responses",
+      "count_tokens",
+      "messages",
+      "responses.compact",
+    ],
+    quota: true,
     modelDiscovery: "catalog",
   },
   async beginAuth(context, options) {
@@ -277,14 +293,57 @@ export const claude: ProviderAdapter = {
       lastAuthenticatedAt: state.authenticatedAt,
     });
   },
-  async getQuota() {
-    return ok({ supported: false, checkedAt: new Date().toISOString(), windows: [] });
+  async getQuota(state, context) {
+    if (text(state.credentials.apiKey)) return quota([], false);
+    const token = text(state.credentials.accessToken);
+    if (!token) return fail("auth-required", "Claude login is required.");
+    const result = await quotaJSON(context, "https://api.anthropic.com/api/oauth/usage", {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-cli/2.1.280 (external, cli)",
+        "Content-Type": "application/json",
+      },
+    });
+    if (!result.ok) return result;
+    const windows = Object.entries(result.value).flatMap(([name, value]) => {
+      const usage = quotaRecord(value),
+        used = number(usage.utilization);
+      if (used === null && !usage.resets_at) return [];
+      return [
+        window(name, {
+          remainingPercent: percent(used === null ? null : 100 - used),
+          resetsAt: timestamp(usage.resets_at),
+          durationSeconds:
+            name === "five_hour"
+              ? 18000
+              : name.startsWith("seven_day") || name === "iguana_necktie"
+                ? 604800
+                : null,
+        }),
+      ];
+    });
+    const extra = quotaRecord(result.value.extra_usage);
+    if (extra.is_enabled === true) {
+      const limit = number(extra.monthly_limit),
+        used = number(extra.used_credits),
+        utilization = number(extra.utilization);
+      windows.push(
+        window("extra-usage", {
+          limit,
+          remaining: limit !== null && used !== null ? Math.max(0, limit - used) : null,
+          remainingPercent: percent(utilization === null ? null : 100 - utilization),
+          unit: "usd-cents",
+        }),
+      );
+    }
+    return quota(windows);
   },
   async listModels() {
     return ok(models);
   },
   async execute(request, state, context) {
-    return executeAnthropic(request, async (body, signal) => {
+    return executeAnthropic(request, async (body, signal, action) => {
       const headers = new Headers({
         "content-type": "application/json",
         "anthropic-version": "2023-06-01",
@@ -300,13 +359,16 @@ export const claude: ProviderAdapter = {
         headers.set("User-Agent", "claude-cli/2.1.280 (external, cli)");
         headers.set("x-app", "cli");
       }
-      return context.fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-        signal: AbortSignal.any([signal, context.signal]),
-        redirect: "error",
-      });
+      return context.fetch(
+        `https://api.anthropic.com/v1/messages${action === "count" ? "/count_tokens" : ""}`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+          signal: AbortSignal.any([signal, context.signal]),
+          redirect: "error",
+        },
+      );
     });
   },
 };

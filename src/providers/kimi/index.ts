@@ -1,3 +1,4 @@
+import { executeAnthropic } from "../../protocols/anthropic.js";
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { createDeviceSession } from "../../auth/device.js";
@@ -5,6 +6,7 @@ import { ok, fail } from "../../result.js";
 import { protocolError } from "../../protocols/openai.js";
 import type { CredentialState, ProviderAdapter, ProviderContext } from "../contract.js";
 import type { Result } from "../../types.js";
+import { quota, quotaJSON, record, number, percent, timestamp, window } from "../quota.js";
 
 // CLIProxyAPI e2bff010: internal/auth/kimi and internal/registry/models/models.json.
 const clientID = "17e5f671-d194-4dfb-9706-5516cb48c098";
@@ -133,8 +135,8 @@ function adapter(provider: "kimi" | "kimi-ai"): ProviderAdapter {
       id: provider,
       name: provider === "kimi" ? "Kimi" : "Kimi AI",
       authMethods: ["device", "api-key"],
-      endpoints: ["models", "chat.completions", "responses"],
-      quota: false,
+      endpoints: ["models", "chat.completions", "responses", "count_tokens", "messages"],
+      quota: true,
       modelDiscovery: "catalog",
     },
     async beginAuth(context, options) {
@@ -284,8 +286,65 @@ function adapter(provider: "kimi" | "kimi-ai"): ProviderAdapter {
         lastAuthenticatedAt: state.authenticatedAt,
       });
     },
-    async getQuota() {
-      return ok({ supported: false, checkedAt: new Date().toISOString(), windows: [] });
+    async getQuota(state, context) {
+      const token = state.credentials.apiKey ?? state.credentials.accessToken;
+      if (typeof token !== "string" || !token)
+        return fail("auth-required", "Kimi authentication required.");
+      const result = await quotaJSON(context, `${apiURL}/v1/usages`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!result.ok) return result;
+      const rows = [
+        ...(Array.isArray(result.value.limits) ? result.value.limits : []),
+        ...(result.value.usage ? [{ name: "weekly", detail: result.value.usage }] : []),
+      ];
+      const monthly = record(record(result.value.usages).limit_month_total),
+        ratio = number(monthly.used_ratio);
+      const windows = rows.map((value, index) => {
+        const row = record(value),
+          detail = record(row.detail ?? row),
+          period = record(row.window);
+        const limit = number(detail.limit),
+          used = number(detail.used);
+        const remaining =
+          number(detail.remaining) ??
+          (limit !== null && used !== null ? Math.max(0, limit - used) : null);
+        const duration = number(period.duration ?? row.duration ?? detail.duration),
+          unit = String(period.timeUnit ?? row.timeUnit ?? detail.timeUnit ?? "")
+            .toLowerCase()
+            .replace(/^time_unit_/, "");
+        const scale =
+          unit === "second" || unit === "seconds"
+            ? 1
+            : unit === "minute" || unit === "minutes"
+              ? 60
+              : unit === "hour" || unit === "hours"
+                ? 3600
+                : unit === "day" || unit === "days"
+                  ? 86400
+                  : null;
+        const resetIn = number(detail.reset_in ?? detail.resetIn ?? detail.ttl);
+        return window(String(row.name ?? detail.name ?? `limit-${index + 1}`), {
+          limit,
+          remaining,
+          remainingPercent:
+            limit !== null && limit > 0 && remaining !== null
+              ? percent((remaining / limit) * 100)
+              : null,
+          durationSeconds: duration !== null && scale !== null ? duration * scale : null,
+          resetsAt:
+            timestamp(detail.reset_at ?? detail.resetAt ?? detail.reset_time ?? detail.resetTime) ??
+            (resetIn !== null && resetIn >= 0 ? timestamp(Date.now() / 1000 + resetIn) : null),
+        });
+      });
+      if (ratio !== null)
+        windows.push(
+          window("monthly", {
+            remainingPercent: percent((1 - ratio) * 100),
+            resetsAt: timestamp(monthly.reset_time),
+          }),
+        );
+      return quota(windows);
     },
     async listModels() {
       return ok(
@@ -299,6 +358,29 @@ function adapter(provider: "kimi" | "kimi-ai"): ProviderAdapter {
     },
     async execute(request, state, context) {
       const path = new URL(request.url).pathname;
+      if (
+        ["/v1/messages", "/v1/messages/count_tokens", "/v1/chat/completions/count_tokens"].includes(
+          path,
+        )
+      ) {
+        return executeAnthropic(request, (body, signal, action) =>
+          context.fetch(
+            `${apiURL}/v1/messages${action === "count" ? "/count_tokens?beta=true" : ""}`,
+            {
+              method: "POST",
+              headers: {
+                ...headers(String(state.credentials.deviceID ?? "")),
+                "Content-Type": "application/json",
+                "anthropic-version": "2023-06-01",
+                Authorization: `Bearer ${state.credentials.apiKey ?? state.credentials.accessToken}`,
+              },
+              body: JSON.stringify({ ...body, model: nativeModel(String(body.model)) }),
+              signal: AbortSignal.any([signal, context.signal]),
+              redirect: "error",
+            },
+          ),
+        );
+      }
       if (!["/v1/chat/completions", "/v1/responses"].includes(path) || request.method !== "POST") {
         return protocolError("Kimi supports Chat Completions and Responses only.", 404);
       }

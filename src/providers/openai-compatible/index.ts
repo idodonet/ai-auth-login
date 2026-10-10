@@ -1,3 +1,4 @@
+import { estimateTokens } from "../../protocols/tokens.js";
 import { fail, ok } from "../../result.js";
 import type { Model, Result } from "../../types.js";
 import type { CredentialState, ProviderAdapter, ProviderContext } from "../contract.js";
@@ -32,6 +33,12 @@ function valid(state: CredentialState): boolean {
 
 export function createProvider(): ProviderAdapter {
   const execute: ProviderAdapter["execute"] = async (request, state, context) => {
+    if (
+      ["/v1/chat/completions/count_tokens", "/v1/messages/count_tokens"].includes(
+        new URL(request.url).pathname,
+      )
+    )
+      return estimateTokens(request);
     if (!valid(state)) {
       return Response.json(
         { error: { message: "Invalid upstream credentials", type: "authentication_error" } },
@@ -120,7 +127,15 @@ export function createProvider(): ProviderAdapter {
       id: "openai-compatibility",
       name: "OpenAI-compatible upstream",
       authMethods: ["api-key"],
-      endpoints: ["models", "chat.completions", "responses", "embeddings", "images", "audio"],
+      endpoints: [
+        "models",
+        "chat.completions",
+        "responses",
+        "embeddings",
+        "images",
+        "audio",
+        "count_tokens",
+      ],
       quota: false,
       modelDiscovery: "live",
     },

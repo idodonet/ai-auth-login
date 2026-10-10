@@ -73,10 +73,12 @@ test("Claude callback rejects state mismatch and accepts manual code#state", asy
   login.cancel();
 });
 
-test("Claude profile reports upstream identity and keeps unknown plan/quota unknown", async () => {
+test("Claude profile reports upstream identity and quota reads OAuth usage", async () => {
   const ctx = context(async (input, init) => {
-    assert.equal(String(input), "https://api.anthropic.com/api/oauth/profile");
     assert.equal(new Headers(init?.headers).get("authorization"), "Bearer old");
+    if (String(input).endsWith("/usage"))
+      return Response.json({ five_hour: { utilization: 20, resets_at: "2026-10-10T17:00:00Z" } });
+    assert.equal(String(input), "https://api.anthropic.com/api/oauth/profile");
     return Response.json({ account: { uuid: "account", email: "a@example.com" } });
   });
   const result = await claude.getAccount(oauth, ctx);
@@ -86,7 +88,8 @@ test("Claude profile reports upstream identity and keeps unknown plan/quota unkn
     assert.equal(result.value?.plan, null);
   }
   const quota = await claude.getQuota(oauth, ctx);
-  assert.equal(quota.ok && quota.value.supported, false);
+  assert.equal(quota.ok && quota.value.supported, true);
+  if (quota.ok) assert.equal(quota.value.windows[0].remainingPercent, 80);
 });
 
 test("Claude inference replaces SDK credentials with provider-specific headers", async () => {

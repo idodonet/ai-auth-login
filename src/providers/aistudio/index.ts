@@ -4,7 +4,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { ProviderAdapter, CredentialState } from "../contract.js";
 import { ok, fail } from "../../result.js";
 import type { AIStudioConnection } from "./browser-client.js";
-import { executeGemini } from "../../protocols/gemini.js";
+import { geminiCountBody, executeGemini } from "../../protocols/gemini.js";
 export { connectAIStudioBrowser } from "./browser-client.js";
 export type { AIStudioConnection } from "./browser-client.js";
 
@@ -280,7 +280,7 @@ export function createProvider(): ProviderAdapter {
       id: "aistudio",
       name: "AI Studio",
       authMethods: ["relay"],
-      endpoints: ["models", "chat.completions", "responses"],
+      endpoints: ["models", "chat.completions", "responses", "count_tokens", "generateContent"],
       quota: false,
       modelDiscovery: "live",
     },
@@ -387,9 +387,8 @@ export function createProvider(): ProviderAdapter {
       }
     },
     async execute(request, _state, context) {
-      const streaming = ((await request.clone().json()) as { stream?: boolean }).stream === true;
-      return executeGemini(request, async (body, signal) => {
-        const { model, stream: _stream, ...payload } = body;
+      return executeGemini(request, async (body, signal, action) => {
+        const { model, stream, ...payload } = body;
         const config = payload.generationConfig as
           { thinkingConfig?: { thinkingLevel?: unknown } } | undefined;
         const level = config?.thinkingConfig?.thinkingLevel;
@@ -403,11 +402,11 @@ export function createProvider(): ProviderAdapter {
           throw new Error("Invalid AI Studio model");
         }
         return relayFetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:${streaming ? "streamGenerateContent?alt=sse" : "generateContent"}`,
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:${action === "count" ? "countTokens" : stream ? "streamGenerateContent?alt=sse" : "generateContent"}`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
+            body: JSON.stringify(action === "count" ? geminiCountBody(model, payload) : payload),
             signal: AbortSignal.any([signal, context.signal]),
           },
         );

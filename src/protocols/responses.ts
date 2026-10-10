@@ -1,3 +1,4 @@
+import { seal, unseal, reasoningPrefix, compactionPrefix } from "./capsules.js";
 import { protocolError, rejectFields, translatedHeaders } from "./openai.js";
 import type { JSONBody, NativeFetch } from "./openai.js";
 import { encodeSSE, parseSSE, streamSSE } from "./sse.js";
@@ -123,19 +124,45 @@ export function responsesToChat(body: JSONBody): JSONBody {
   }
   for (const item of input) {
     if (!item.type || item.type === "message") {
-      messages.push({ role: item.role, content: chatContent(item.content) });
+      const last = messages.at(-1);
+      if (item.role === "assistant" && last?.role === "assistant" && last.content === null)
+        last.content = chatContent(item.content);
+      else messages.push({ role: item.role, content: chatContent(item.content) });
     } else if (item.type === "function_call") {
       const last = messages.at(-1);
       const call = {
         id: item.call_id,
         type: "function",
         function: { name: item.name, arguments: item.arguments },
+        ...(item.thought_signature ? { thought_signature: item.thought_signature } : {}),
       };
       if (last?.role === "assistant") {
         (last.tool_calls ??= []).push(call);
       } else {
         messages.push({ role: "assistant", content: null, tool_calls: [call] });
       }
+    } else if (item.type === "reasoning") {
+      if (!item.encrypted_content) continue; // Display summaries are not replayable native thinking.
+      const carrier = unseal(reasoningPrefix, item.encrypted_content);
+      if (!Array.isArray(carrier.reasoning_blocks))
+        throw new Error("Invalid reasoning continuation");
+      const last = messages.at(-1);
+      if (last?.role === "assistant")
+        (last.reasoning_blocks ??= []).push(...carrier.reasoning_blocks);
+      else
+        messages.push({
+          role: "assistant",
+          content: null,
+          reasoning_blocks: carrier.reasoning_blocks,
+        });
+    } else if (item.type === "compaction") {
+      const capsule = unseal(compactionPrefix, item.encrypted_content);
+      if (typeof capsule.summary !== "string" || !capsule.summary.trim())
+        throw new Error("Invalid compaction summary");
+      messages.push({
+        role: "developer",
+        content: "Context summary from previous turns:\n" + capsule.summary,
+      });
     } else if (item.type === "function_call_output") {
       if (typeof item.output !== "string") {
         throw new Error("Structured function output is unsupported");
@@ -219,7 +246,23 @@ export function chatToResponses(body: JSONBody): JSONBody {
   const result = copy(body),
     input: JSONBody[] = [];
   for (const message of body.messages) {
-    rejectFields(message, ["role", "content", "tool_calls", "tool_call_id"]);
+    rejectFields(message, [
+      "role",
+      "content",
+      "tool_calls",
+      "tool_call_id",
+      "reasoning_items",
+      "reasoning_content",
+      "reasoning_blocks",
+      "reasoning_signature",
+    ]);
+    if (message.reasoning_items) input.push(...message.reasoning_items);
+    else if (message.reasoning_blocks?.length)
+      input.push({
+        type: "reasoning",
+        summary: [],
+        encrypted_content: seal(reasoningPrefix, { reasoning_blocks: message.reasoning_blocks }),
+      });
     if (message.role === "tool") {
       input.push({
         type: "function_call_output",
@@ -239,6 +282,7 @@ export function chatToResponses(body: JSONBody): JSONBody {
           call_id: call.id,
           name: call.function.name,
           arguments: call.function.arguments,
+          ...(call.thought_signature ? { thought_signature: call.thought_signature } : {}),
         });
       }
     }
@@ -346,12 +390,21 @@ export function chatCompletionToResponse(chat: JSONBody, request: JSONBody): JSO
   }
   const message = choice.message,
     output: JSONBody[] = [];
-  if (message.reasoning_content) {
+  if (message.reasoning_content || message.reasoning_blocks?.length) {
     output.push({
       id: `rs_${chat.id}`,
       type: "reasoning",
       status: "completed",
-      summary: [{ type: "summary_text", text: message.reasoning_content }],
+      summary: message.reasoning_content
+        ? [{ type: "summary_text", text: message.reasoning_content }]
+        : [],
+      ...(message.reasoning_blocks?.length
+        ? {
+            encrypted_content: seal(reasoningPrefix, {
+              reasoning_blocks: message.reasoning_blocks,
+            }),
+          }
+        : {}),
     });
   }
   if (message.content != null || message.refusal) {
@@ -373,6 +426,7 @@ export function chatCompletionToResponse(chat: JSONBody, request: JSONBody): JSO
       call_id: call.id,
       name: call.function.name,
       arguments: call.function.arguments,
+      ...(call.thought_signature ? { thought_signature: call.thought_signature } : {}),
     });
   }
   for (const image of message.images ?? []) {
@@ -404,6 +458,7 @@ export function responseToChatCompletion(response: JSONBody): JSONBody {
     refusal = "",
     reasoning = "",
     calls: JSONBody[] = [],
+    reasoningItems: JSONBody[] = [],
     images: JSONBody[] = [];
   for (const item of response.output ?? []) {
     if (item.type === "message") {
@@ -421,12 +476,14 @@ export function responseToChatCompletion(response: JSONBody): JSONBody {
         id: item.call_id,
         type: "function",
         function: { name: item.name, arguments: item.arguments },
+        ...(item.thought_signature ? { thought_signature: item.thought_signature } : {}),
       });
     } else if (item.type === "image_generation_call") {
       if (item.result) {
         images.push({ type: "image_url", image_url: { url: imageDataURL(item) } });
       }
     } else if (item.type === "reasoning") {
+      if (item.encrypted_content) reasoningItems.push(item);
       for (const part of item.summary ?? []) {
         reasoning += part.text ?? "";
       }
@@ -450,6 +507,7 @@ export function responseToChatCompletion(response: JSONBody): JSONBody {
           content: content || null,
           ...(refusal ? { refusal } : {}),
           ...(reasoning ? { reasoning_content: reasoning } : {}),
+          ...(reasoningItems.length ? { reasoning_items: reasoningItems } : {}),
           ...(images.length ? { images } : {}),
           ...(calls.length ? { tool_calls: calls } : {}),
         },
@@ -611,6 +669,7 @@ async function* chatStreamToResponses(
           });
         }
         const item = output[outputIndex];
+        if (call.thought_signature) item.thought_signature = call.thought_signature;
         if (call.id) {
           item.call_id = call.id;
         }
@@ -626,7 +685,7 @@ async function* chatStreamToResponses(
           });
         }
       }
-      if (delta.reasoning_content) {
+      if (delta.reasoning_content || delta.reasoning_blocks?.length) {
         if (reasoningIndex === undefined) {
           reasoningIndex = output.length;
           const item = {
@@ -650,16 +709,32 @@ async function* chatStreamToResponses(
           });
         }
         const item = output[reasoningIndex];
-        item.summary[0].text += delta.reasoning_content;
-        yield emit("response.reasoning_summary_text.delta", {
-          item_id: item.id,
-          output_index: reasoningIndex,
-          summary_index: 0,
-          delta: delta.reasoning_content,
-        });
+        if (delta.reasoning_blocks?.length) {
+          const blocks = (item.reasoning_blocks ??= []);
+          for (const block of delta.reasoning_blocks) {
+            const last = blocks.at(-1);
+            if (last?.thought && block.thought && !last.thoughtSignature) {
+              const text = last.text + block.text;
+              Object.assign(last, block, { text });
+            } else blocks.push({ ...block });
+          }
+          item.encrypted_content = seal(reasoningPrefix, {
+            reasoning_blocks: item.reasoning_blocks,
+          });
+        }
+        if (delta.reasoning_content) {
+          item.summary[0].text += delta.reasoning_content ?? "";
+          yield emit("response.reasoning_summary_text.delta", {
+            item_id: item.id,
+            output_index: reasoningIndex,
+            summary_index: 0,
+            delta: delta.reasoning_content,
+          });
+        }
       }
     }
   }
+  for (const item of output) delete item.reasoning_blocks;
   if (!terminal) {
     throw new Error("Upstream Chat stream ended before completion");
   }
@@ -772,6 +847,22 @@ async function* responsesStreamToChat(
     ) {
       yield chunk({
         images: [{ type: "image_url", image_url: { url: imageDataURL(value.item) } }],
+      });
+    } else if (
+      type === "response.output_item.done" &&
+      value.item.type === "reasoning" &&
+      value.item.encrypted_content
+    ) {
+      yield chunk({ reasoning_items: [value.item] });
+    } else if (
+      type === "response.output_item.done" &&
+      value.item.type === "function_call" &&
+      value.item.thought_signature
+    ) {
+      yield chunk({
+        tool_calls: [
+          { index: calls.get(value.item.id), thought_signature: value.item.thought_signature },
+        ],
       });
     } else if (type === "response.refusal.delta") {
       yield chunk({ refusal: value.delta });
@@ -915,11 +1006,67 @@ export async function normalizeResponsesResponse(
 export async function executeResponses(
   request: Request,
   fetchNative: NativeFetch,
+  allowCompact = false,
 ): Promise<Response> {
   let body: JSONBody, translated: JSONBody;
+  let compact = new URL(request.url).pathname.endsWith("/responses/compact");
   try {
     body = (await request.json()) as JSONBody;
-    translated = responsesToChat(body);
+    if (compact && body.stream)
+      return protocolError("Streaming compact is unsupported; use a Responses compaction_trigger");
+    compact ||=
+      Array.isArray(body.input) &&
+      body.input.some((item: JSONBody) => item.type === "compaction_trigger");
+    if (compact && !allowCompact)
+      return protocolError("Compaction is unsupported for this provider", 404);
+    if (compact) {
+      const input =
+        typeof body.input === "string" ? [{ role: "user", content: body.input }] : body.input;
+      if (!Array.isArray(input)) throw new Error("Compaction input must be text or an array");
+      const summaryBody: JSONBody = {
+        ...body,
+        stream: false,
+        input: [
+          ...input.filter((item: JSONBody) => item.type !== "compaction_trigger"),
+          {
+            role: "user",
+            content:
+              "Please provide a concise and comprehensive summary of the preceding conversation and task progress so far, including user goals, key findings, actions taken, and current status, so that work can continue smoothly.",
+          },
+        ],
+      };
+      for (const field of [
+        "tool_choice",
+        "previous_response_id",
+        "parallel_tool_calls",
+        "additional_tools",
+        "truncation",
+        "metadata",
+      ])
+        delete summaryBody[field];
+      translated = responsesToChat(summaryBody);
+      if (translated.tools?.length) translated.tool_choice = "none";
+      else
+        for (const message of translated.messages) {
+          if (message.role === "tool") {
+            message.role = "user";
+            message.content = `Tool result ${message.tool_call_id}: ${message.content}`;
+            delete message.tool_call_id;
+          }
+          if (message.tool_calls?.length) {
+            const text = message.tool_calls
+              .map(
+                (call: JSONBody) =>
+                  `Tool call ${call.function.name} (${call.id}): ${call.function.arguments}`,
+              )
+              .join("\n");
+            message.content = Array.isArray(message.content)
+              ? [...message.content, { type: "text", text }]
+              : [message.content, text].filter(Boolean).join("\n");
+            delete message.tool_calls;
+          }
+        }
+    } else translated = responsesToChat(body);
   } catch (error) {
     return protocolError(error instanceof Error ? error.message : "Invalid request");
   }
@@ -929,13 +1076,59 @@ export async function executeResponses(
   if (!response.ok) {
     return response;
   }
-  if (body.stream) {
+  if (body.stream && !compact) {
     return streamSSE(chatStreamToResponses(response, body, signal), response, () =>
       controller.abort(),
     );
   }
   try {
-    return Response.json(chatCompletionToResponse(await response.json(), body), {
+    const completion = (await response.json()) as JSONBody;
+    if (compact) {
+      const summary = completion.choices?.[0]?.message?.content;
+      if (
+        typeof summary !== "string" ||
+        !summary.trim() ||
+        completion.choices[0].finish_reason === "length"
+      )
+        throw new Error("Incomplete compaction summary");
+      const item = {
+        id: `cmp_${crypto.randomUUID()}`,
+        type: "compaction",
+        status: "completed",
+        encrypted_content: seal(compactionPrefix, {
+          summary,
+          model: body.model,
+          created_at: Math.floor(Date.now() / 1000),
+        }),
+      };
+      const value = {
+        id: `resp_${crypto.randomUUID()}`,
+        object: "response.compaction",
+        status: "completed",
+        created_at: Math.floor(Date.now() / 1000),
+        model: body.model,
+        output: [item],
+        usage: responseUsage(completion.usage),
+      };
+      if (body.stream) {
+        async function* events() {
+          const frames: [string, JSONBody][] = [
+            ["response.created", { response: { ...value, status: "in_progress", output: [] } }],
+            [
+              "response.output_item.added",
+              { output_index: 0, item: { ...item, status: "in_progress" } },
+            ],
+            ["response.output_item.done", { output_index: 0, item }],
+            ["response.completed", { response: value }],
+          ];
+          for (const [sequence_number, [type, data]] of frames.entries())
+            yield encodeSSE(type, { type, sequence_number, ...data });
+        }
+        return streamSSE(events(), response);
+      }
+      return Response.json(value, { headers: translatedHeaders(response) });
+    }
+    return Response.json(chatCompletionToResponse(completion, body), {
       status: response.status,
       headers: translatedHeaders(response),
     });

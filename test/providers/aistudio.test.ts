@@ -302,3 +302,39 @@ test("AI Studio discovers all model pages and omits non-generative models", asyn
     await adapter.close!();
   }
 });
+
+test("AI Studio public token count uses the browser countTokens route without generation", async () => {
+  const { ProviderSession } = await import("../../src/session.js");
+  const session = new ProviderSession();
+  try {
+    assert.ok((await session.connect("aistudio", { kind: "relay" })).ok);
+    const connection = session.getConnection()!;
+    const browser = await connectBrowser(connection.url, connection.token);
+    browser.on("message", (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type !== "http_request") return;
+      assert.match(message.payload.url, /gemini-test:countTokens$/);
+      const body = JSON.parse(message.payload.body);
+      assert.equal(body.generateContentRequest.systemInstruction.parts[0].text, "system");
+      browser.send(
+        JSON.stringify({
+          id: message.id,
+          type: "http_response",
+          payload: { status: 200, headers: {}, body: JSON.stringify({ totalTokens: 8 }) },
+        }),
+      );
+    });
+    const result = await session.countTokens({
+      model: "gemini-test",
+      messages: [
+        { role: "system", content: "system" },
+        { role: "user", content: "hello" },
+      ],
+    });
+    assert.ok(result.ok);
+    assert.deepEqual(result.value, { inputTokens: 8, estimated: false });
+    assert.equal(session.getStats().requestsSent, 0);
+  } finally {
+    await session.close();
+  }
+});

@@ -1,3 +1,4 @@
+import type WebSocket from "ws";
 import type {
   Account,
   AuthOptions,
@@ -53,6 +54,10 @@ export interface ProviderAdapter {
   listModels(state: CredentialState, context: ProviderContext): Promise<Result<readonly Model[]>>;
   /** Request uses canonical SDK-facing /v1/... paths. Preserve upstream status, headers and streaming. */
   execute(request: Request, state: CredentialState, context: ProviderContext): Promise<Response>;
+  openResponsesSocket?(
+    state: CredentialState,
+    context: ProviderContext,
+  ): Promise<Result<WebSocket>>;
   getConnection?(): RelayConnection | null;
   close?(): void | Promise<void>;
 }

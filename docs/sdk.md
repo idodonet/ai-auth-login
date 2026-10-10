@@ -101,7 +101,12 @@ listeners belongs to the application and must be awaited there.
 
 `getAccount()` returns available account metadata or `null`. Unknown fields are
 `null`. `getQuota()` returns explicit unsupported status when the provider has
-no implemented numeric quota source. `resetsAt` is an ISO timestamp for local
+no numeric quota source for that credential type. A provider descriptor's
+`quota: true` means an implementation exists; check the returned `supported`
+for the current connection. Subscription quota supports Codex OAuth,
+Claude OAuth, Antigravity, xAI OAuth billing, Kimi/Kimi AI, Meta device login,
+and Devin. Monetary amounts use `usd-cents`; other unknown units remain `null`.
+`resetsAt` is an ISO timestamp for local
 countdowns. `getStats()` counts upstream SDK request attempts, including SDK retries and
 resource operations such as video retrieval/download;
 account, quota, and model discovery requests are excluded.
@@ -165,3 +170,73 @@ node examples/basic.ts
 ```
 
 Run these commands from the repository root. [sdk.ts](../examples/sdk.ts) restores saved state and sends a Responses request. [basic.ts](../examples/basic.ts) supports restored state, callback/device login, or an API-key upstream. It saves credentials to `AUTH_STATE_FILE` (default `.provider-state.json`) using restricted file permissions and serialized writes.
+
+## Token counts and native APIs
+
+```ts
+const count = await session.countTokens({
+  model: "your-model",
+  messages: [{ role: "user", content: "Hello" }],
+});
+if (count.ok) console.log(count.value.inputTokens, count.value.estimated);
+```
+
+Counting accepts Chat or Responses input and never starts inference. Native
+counts are provided by Claude, Kimi, Google and Antigravity; Codex, xAI, Meta,
+Devin and generic upstreams return BPE text/schema estimates. Estimates omit
+multimodal tokens and protocol overhead. This session operation, like quota
+queries, does not increment SDK inference request counters.
+
+The SDK's low-level `post()` reaches provider-native JSON APIs:
+
+```ts
+if (created.ok) {
+  // Claude/Kimi:
+  await created.value.post("/messages/count_tokens", {
+    body: { model: "your-model", messages: [{ role: "user", content: "Hello" }] },
+  });
+  // Gemini-family providers; move outside the SDK's /v1 prefix:
+  await created.value.post("/../v1beta/models/your-model:generateContent", {
+    body: { contents: [{ role: "user", parts: [{ text: "Hello" }] }] },
+  });
+  // Gemini Interactions uses /../v1beta/interactions.
+}
+```
+
+These routes use the connected provider's native payload and response format.
+Unsupported paths fail explicitly. Preserve full Responses output items when
+continuing a translated conversation, including reasoning `encrypted_content`
+and function-call `thought_signature`; display summaries cannot replace signed
+native thinking. Claude/Antigravity also implement `responses.compact()` and
+Responses `compaction_trigger` input. Compact creates a summary, so context can
+lose detail. Codex/xAI compact forwards to the upstream's native API.
+
+## Responses WebSocket
+
+```ts
+const connected = await session.openResponsesSocket({ signal });
+if (connected.ok) {
+  const socket = connected.value;
+  socket.on("message", (data) => console.log(JSON.parse(data.toString())));
+  socket.on("error", (error) => console.error(error.message));
+  socket.send(
+    JSON.stringify({
+      type: "response.create",
+      model: "your-model",
+      store: false,
+      instructions: "",
+      input: [{ role: "user", content: "Hello" }],
+    }),
+  );
+  // Close when this conversation is done; session.close()/logout() also close it.
+  // socket.close();
+}
+```
+
+This Node.js `ws` connection supports Codex and xAI native Responses events.
+Opening returns structured errors; later socket errors/events use `ws` listeners.
+It is separate from OpenAI SDK HTTP streaming and is excluded from HTTP request
+counters. Reconnection and native request payloads belong to the caller.
+
+xAI `audio.speech.create()` supports mp3, wav and pcm, and maps OpenAI voice names
+to Grok voice IDs. Binary audio, upstream errors and cancellation are preserved.
